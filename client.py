@@ -1,7 +1,10 @@
 # bot.py
 """
-Termux-compatible Telegram bot for IVASMS OTP-forwarding & rewards.
-Make sure to set the CONFIG section before running.
+Full Telegram bot with:
+- IVASMS login + inbox polling
+- Automatic fetching of "My Numbers" page and sync to numbers.json
+- User assignment, OTP crediting, withdrawals & admin panel
+- Designed for Termux / Linux with python-telegram-bot[job-queue]
 """
 
 import os
@@ -29,15 +32,17 @@ from telegram.ext import (
 # ---------------------------
 # CONFIG — FILL THESE VALUES
 # ---------------------------
-TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"
+TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 ADMIN_ID = 6812877108
 TEAM_CHAT_ID = -1002224177347
 
 IVASMS_EMAIL = "your_ivasms_email@example.com"
 IVASMS_PASSWORD = "your_ivasms_password"
-IVASMS_URL = "https://www.ivasms.com/portal/live/test_sms"  # inbox page
+IVASMS_NUMBERS_URL = "https://www.ivasms.com/portal/numbers"      # My Numbers page
+IVASMS_INBOX_URL = "https://www.ivasms.com/portal/live/test_sms"  # inbox page (same as earlier)
 
-POLL_SECONDS = 25           # how often to poll IVASMS
+POLL_SECONDS = 25           # how often to poll IVASMS inbox for new SMS
+NUMBERS_REFRESH_SECONDS = 300  # refresh numbers pool every 5 minutes (adjustable)
 REWARD_PER_OTP = 1          # Tk per OTP
 MIN_WITHDRAW = 250          # minimum Tk to request withdrawal
 
@@ -116,16 +121,16 @@ def create_logged_session():
 def fetch_messages_from_page(session):
     """
     Returns list of dicts: {id, sender_or_to, content}
-    This is a generic parser — adjust if IVASMS HTML is different.
+    Generic parser for inbox table — tweak if your IVASMS HTML differs.
     """
     try:
-        r = session.get(IVASMS_URL, timeout=20)
+        r = session.get(IVASMS_INBOX_URL, timeout=20)
     except Exception as e:
         print("Failed to load IVASMS inbox:", e)
         return []
 
     if r.status_code != 200:
-        print("IVASMS page status:", r.status_code)
+        print("IVASMS inbox page status:", r.status_code)
         return []
 
     soup = BeautifulSoup(r.text, "html.parser")
@@ -146,7 +151,97 @@ def fetch_messages_from_page(session):
     return results
 
 # ---------------------------
-# User & Number Management
+# Fetch "My Numbers" from IVASMS and sync to numbers.json
+# ---------------------------
+def fetch_my_numbers(session):
+    """
+    Parse the 'My Numbers' page and return list of dicts:
+      {"number": "+88017...", "range_name": "NIGERIA 17768", "country": "NIGERIA", ...}
+    Note: adapt selectors if IVASMS changes layout.
+    """
+    try:
+        r = session.get(IVASMS_NUMBERS_URL, timeout=20)
+    except Exception as e:
+        print("Failed to load My Numbers page:", e)
+        return []
+
+    if r.status_code != 200:
+        print("My Numbers page status:", r.status_code)
+        return []
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    results = []
+
+    # Heuristic: find the main table rows — many dashboards have <table> with numbers.
+    # We'll search for "My Numbers" table rows using the number pattern.
+    rows = soup.select("table tr")
+    for row in rows:
+        cells = row.find_all("td")
+        if not cells or len(cells) < 1:
+            continue
+        # Find a cell that looks like a number (digits length >= 8)
+        candidate = None
+        for c in cells:
+            txt = c.get_text(strip=True)
+            if re.search(r"\d{8,}", txt):
+                candidate = txt
+                break
+        if not candidate:
+            continue
+        # Extract number and optional country/range from neighboring cells
+        number = candidate
+        range_name = cells[1].get_text(strip=True) if len(cells) > 1 else ""
+        # try to guess country from the range_name or number prefix
+        country = ""
+        if range_name:
+            country = range_name.split()[0]
+        else:
+            # attempt from number prefix
+            prefix = normalize_num(number)[:3]
+            country_map = {"880":"BANGLADESH","225":"IVORY COAST","234":"NIGERIA","91":"INDIA","1":"USA"}
+            country = country_map.get(prefix, "")
+        results.append({
+            "number": number,
+            "range_name": range_name,
+            "country": country,
+            "assigned_to": None
+        })
+
+    # deduplicate by normalized number
+    seen = set()
+    unique = []
+    for ritem in results:
+        nn = normalize_num(ritem["number"])
+        if nn and nn not in seen:
+            seen.add(nn)
+            unique.append(ritem)
+    print(f"Fetched {len(unique)} numbers from My Numbers page.")
+    return unique
+
+def sync_numbers_with_ivass(session):
+    """
+    Fetch numbers from IVASMS and merge/update local numbers.json
+    - Adds new numbers
+    - Does NOT automatically unassign numbers (keeps assigned_to if present)
+    """
+    remote = fetch_my_numbers(session)
+    if not remote:
+        return False, 0
+    local = load_json(NUMBERS_FILE, [])
+    local_map = { normalize_num(n.get("number")): n for n in local if n.get("number") }
+    added = 0
+    for rn in remote:
+        key = normalize_num(rn["number"])
+        if key not in local_map:
+            # new number -> add
+            local.append(rn)
+            added += 1
+    if added > 0:
+        save_json(NUMBERS_FILE, local)
+    return True, added
+
+# ---------------------------
+# User & Number Management (same logic as before)
 # ---------------------------
 def load_users():
     return load_json(USERS_FILE, {})
@@ -227,42 +322,36 @@ OTP_REGEXES = [
 ]
 
 def extract_otp(text):
-    # Try to find the most likely OTP number (longest 4-8 digit sequence)
     found = []
     for regex in OTP_REGEXES:
         m = re.findall(regex, text, flags=re.IGNORECASE)
         if m:
             found.extend(m)
     if not found:
-        # fallback: pick first 4-6 digit substring
         m = re.findall(r"\b(\d{4,6})\b", text)
         if m:
             found = m
-    # choose the longest candidate
     if not found:
         return ""
     candidate = max(found, key=len)
     return candidate
 
 def detect_provider_and_country(text):
-    # Best-effort keywords — refine with real IVASMS table if possible
     provider = ""
     country = ""
-    # provider keywords
     p_keys = ["Melbet","Facebook","Google","WhatsApp","Twitter","Instagram","PayPal","Bkash"]
     for p in p_keys:
         if p.lower() in text.lower():
             provider = p
             break
-    # country keywords or dialing codes
     country_map = {
         "225": "IVORY COAST",
         "880": "BANGLADESH",
+        "234": "NIGERIA",
         "91": "INDIA",
         "1": "USA",
         "44": "UK",
     }
-    # look for known dialcodes in text
     for code, name in country_map.items():
         if code in normalize_num(text):
             country = name
@@ -281,7 +370,7 @@ async def send_message(context: ContextTypes.DEFAULT_TYPE, chat_id, text, parse_
         return False
 
 # ---------------------------
-# Telegram UI and Handlers
+# UI / Menus
 # ---------------------------
 MAIN_MENU = InlineKeyboardMarkup([
     [InlineKeyboardButton("📱 Get Number", callback_data="get_number")],
@@ -304,6 +393,9 @@ AWAITING_BKASH = {}       # tg_id -> amount
 AWAITING_UPLOAD = set()   # admin tg_id awaiting upload
 AWAITING_BROADCAST = {}   # admin tg_id -> True
 
+# ---------------------------
+# Telegram Handlers
+# ---------------------------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = ("Welcome! 🎉\n"
@@ -324,7 +416,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_users()
     numbers = load_numbers()
 
-    # navigation shortcuts
+    # nav
     if data == "open_admin":
         if uid == ADMIN_ID:
             await query.edit_message_text("Admin panel:", reply_markup=ADMIN_MENU)
@@ -382,7 +474,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bal < MIN_WITHDRAW:
             await query.edit_message_text(f"❌ Minimum withdrawal is ৳{MIN_WITHDRAW}. You currently have ৳{bal:.2f}.", reply_markup=MAIN_MENU)
             return
-        # ask for bKash number
         AWAITING_BKASH[uid] = MIN_WITHDRAW
         await query.edit_message_text(f"Please send your bKash number now (e.g., 017XXXXXXXX). You will request ৳{MIN_WITHDRAW}.", reply_markup=None)
         return
@@ -421,7 +512,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pend:
             await query.edit_message_text("No pending withdrawal requests.", reply_markup=ADMIN_MENU)
             return
-        # list each and provide action buttons
         for w in pend:
             txt = (f"User: @{w.get('username','')} ({w.get('tg_id')})\n"
                    f"Amount: ৳{w.get('amount')}\n"
@@ -448,7 +538,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # File upload handler (admin)
 # ---------------------------
 async def upload_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # only admin
     if update.message.from_user.id != ADMIN_ID:
         return
     if update.message.document is None:
@@ -527,7 +616,6 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if uid in AWAITING_BKASH:
         amount = AWAITING_BKASH.pop(uid, None)
         bk = text
-        # basic validation
         if not re.match(r"^\+?\d{10,15}$", bk) and not re.match(r"^01\d{9}$", bk):
             await update.message.reply_text("Invalid bKash number format. Example: 017XXXXXXXX")
             return
@@ -540,7 +628,6 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         if bal < amount:
             await update.message.reply_text(f"Insufficient balance. You have ৳{bal:.2f}")
             return
-        # record withdrawal
         withds = load_withdrawals()
         wid = str(uuid.uuid4())[:8]
         record = {
@@ -555,15 +642,11 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         withds.append(record)
         save_withdrawals(withds)
         await update.message.reply_text(f"✅ Withdrawal request recorded for ৳{amount}. Request ID: {wid}")
-        # notify admin & team (full visibility)
         msg = (f"💵 New withdrawal request\nUser: @{record['username']} ({record['tg_id']})\n"
                f"Amount: ৳{record['amount']}\nBkash: {record['bkash']}\nRequest ID: {record['id']}")
         await send_message(context, ADMIN_ID, msg)
         await send_message(context, TEAM_CHAT_ID, msg)
         return
-
-    # Other text: ignore or reply
-    # Optionally respond to /help text here
 
 # ---------------------------
 # Withdrawal action callbacks (release/decline)
@@ -596,7 +679,6 @@ async def withdraw_action_callback(update: Update, context: ContextTypes.DEFAULT
             await context.bot.send_message(chat_id=TEAM_CHAT_ID, text=f"Withdrawal {wid} declined by admin.")
             await query.edit_message_text(f"Declined request {wid}.")
             return
-        # release
         if action == "release":
             if rec.get("status") != "pending":
                 await query.edit_message_text("Request already handled.")
@@ -611,7 +693,6 @@ async def withdraw_action_callback(update: Update, context: ContextTypes.DEFAULT
             if cur_bal < amt:
                 await query.edit_message_text("User does not have enough balance to release.")
                 return
-            # deduct and mark paid
             user["balance"] = cur_bal - amt
             rec["status"] = "paid"
             rec["handled_at"] = datetime.utcnow().isoformat() + "Z"
@@ -632,7 +713,6 @@ async def withdraw_action_callback(update: Update, context: ContextTypes.DEFAULT
 # IVASMS job: poll inbox, credit users & forward messages
 # ---------------------------
 async def ivasms_job(context: ContextTypes.DEFAULT_TYPE):
-    # run blocking web login + fetch in thread
     def _work():
         session = create_logged_session()
         if not session:
@@ -659,25 +739,22 @@ async def ivasms_job(context: ContextTypes.DEFAULT_TYPE):
         sender_or_to = m.get("sender_or_to","")
         content = m.get("content","")
 
-        # try to extract OTP & metadata
         otp = extract_otp(content)
         provider, country = detect_provider_and_country(content + " " + sender_or_to)
-        # find user
         tg_id, user_rec, matched_number = find_target_for_sms(users, numbers, sender_or_to, content)
 
-        # Build message (exact format requested)
-        # Keep monetary formatting to 2 decimal places
+        # credit & prepare message
         username_disp = user_rec.get("username","") if user_rec else ""
-        earned_text = f"৳{REWARD_PER_OTP:.4f}" if REWARD_PER_OTP < 1 else f"৳{REWARD_PER_OTP:.2f}"
-        total_balance = 0.0
         if tg_id and user_rec:
-            # credit reward
             users.setdefault(str(tg_id), user_rec)
             users[str(tg_id)]["balance"] = users[str(tg_id)].get("balance",0) + REWARD_PER_OTP
             total_balance = users[str(tg_id)]["balance"]
             save_users(users)
+        else:
+            total_balance = 0.0
 
-        # Format message (Markdown)
+        # message formatting
+        earned_text = f"৳{REWARD_PER_OTP:.4f}" if REWARD_PER_OTP < 1 else f"৳{REWARD_PER_OTP:.2f}"
         msg_lines = [
             "📱 **New OTP!** ✨",
             f"📞 **Number:** {matched_number or sender_or_to}",
@@ -688,7 +765,6 @@ async def ivasms_job(context: ContextTypes.DEFAULT_TYPE):
             "",
         ]
         if tg_id and user_rec:
-            # user's name for display
             display_name = user_rec.get("username") or user_rec.get("username") or ""
             msg_lines.append(f"{display_name} **🎉 You have earned {earned_text} for this message!**")
             msg_lines.append(f"💰 **Total Balance:** ৳{total_balance:.2f}")
@@ -696,12 +772,11 @@ async def ivasms_job(context: ContextTypes.DEFAULT_TYPE):
             msg_lines.append("No assigned user for this number.")
         final_msg = "\n".join(msg_lines)
 
-        # send to team
+        # send team + admin
         await send_message(context, TEAM_CHAT_ID, final_msg, parse_mode="Markdown")
-        # send to admin as well
         await send_message(context, ADMIN_ID, final_msg, parse_mode="Markdown")
 
-        # send to user (DM) privately
+        # send to user privately
         if tg_id and user_rec:
             try:
                 await send_message(context, int(tg_id), final_msg, parse_mode="Markdown")
@@ -712,6 +787,24 @@ async def ivasms_job(context: ContextTypes.DEFAULT_TYPE):
 
     if new_flag:
         save_seen(seen)
+
+# ---------------------------
+# Numbers refresh job (periodic): fetch from IVASMS and merge into numbers.json
+# ---------------------------
+async def numbers_refresh_job(context: ContextTypes.DEFAULT_TYPE):
+    def _work():
+        session = create_logged_session()
+        if not session:
+            return (False, 0)
+        return sync_numbers_with_ivass(session)
+    try:
+        success, added = await asyncio.to_thread(_work)
+    except Exception as e:
+        print("Numbers refresh error:", e)
+        success, added = False, 0
+    if success and added:
+        await send_message(context, ADMIN_ID, f"Numbers pool updated — {added} new numbers added.")
+    # no need to notify if zero added
 
 # ---------------------------
 # Application startup
@@ -726,8 +819,9 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
     app.add_handler(CallbackQueryHandler(withdraw_action_callback, pattern=r'^(release_|decline_).+'))
 
-    # schedule IVASMS job
+    # schedule IVASMS inbox polling job and numbers refresh job
     app.job_queue.run_repeating(ivasms_job, interval=POLL_SECONDS, first=10)
+    app.job_queue.run_repeating(numbers_refresh_job, interval=NUMBERS_REFRESH_SECONDS, first=5)
 
     print("Bot starting ...")
     app.run_polling()
