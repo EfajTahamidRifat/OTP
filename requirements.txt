@@ -1,6 +1,31 @@
-python-telegram-bot==20.7
-aiogram==3.13.0
-cloudscraper
-beautifulsoup4
-openpyxl
-aiohttp
+# Telegram bot framework
+aiogram==3.13.1
+
+# HTTP and async requests
+aiohttp==3.10.10
+requests==2.32.3
+
+# Database (SQLite or PostgreSQL ready)
+aiosqlite==0.20.0
+SQLAlchemy==2.0.35
+psycopg2-binary==2.9.9   # Only needed if using PostgreSQL
+
+# Data parsing & HTML/JSON handling
+beautifulsoup4==4.12.3
+lxml==5.3.0
+fake-useragent==1.5.1
+
+# Environment configuration
+python-dotenv==1.0.1
+
+# Background scheduling
+apscheduler==3.10.4
+
+# Logging and utilities
+loguru==0.7.2
+tqdm==4.66.5
+
+# Optional — if your dashboard/admin panel runs on web
+fastapi==0.115.2
+uvicorn==0.30.3
+jinja2==3.1.4
