@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "8119637737:AAEPDFrHrUeAHWHSHkR7ZSE_Hp1vg3sYs9c"
 ADMIN_ID = 6812877108
 GROUP_ID = -1003021667823
-WEBHOOK_URL = "https://your-render-url.onrender.com/webhook"
+WEBHOOK_URL = "https://otp-xfm2.onrender.com/webhook"
 PORT = 10000
 
 OWNER_NAME = "sojib"
