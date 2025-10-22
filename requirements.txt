@@ -1,5 +1,6 @@
 python-telegram-bot==20.7
 aiogram==3.13.0
-playwright
 cloudscraper
 beautifulsoup4
+openpyxl
+aiohttp
